@@ -1,0 +1,121 @@
+name: Build OpenWrt x86_64 (EasyTier route-retry fix)
+
+# 只做一件事：用打过补丁的源码编译 linux-x86_64(musl, 静态) 的 easytier-core / easytier-cli，
+# 复用官方 zip 里的 easytier-web（不重编前端），重新打成一个 zip 并发布 release。
+#
+# 产出的资产名必须与 luci-app-easytier 的 easytier/Makefile 期望一致：
+#   https://github.com/qwgaan/EasyTier/releases/download/v<版本>/easytier-linux-x86_64-v<版本>.zip
+#
+# 用法：Actions -> 本工作流 -> Run workflow，version 填 v2.7.0-fix1，base_version 填 2.7.0。
+# 注意：workflow_dispatch 要求本文件存在于默认分支(main)，但可以用 ref 指向修复分支运行。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '发布 tag，同时是资产名里的版本号（如 v2.7.0-fix1）'
+        required: true
+        default: 'v2.7.0-fix1'
+      base_version:
+        description: '复用 easytier-web 的官方 zip 版本（如 2.7.0）'
+        required: true
+        default: '2.7.0'
+  # 也可以直接往这个分支 push 来触发（workflow_dispatch 需要 Actions 写权限，
+  # 若使用的 PAT 没有该权限，提交一个改动到本分支即可启动构建）。
+  push:
+    branches: ['fix/v2.7.0-route-retry']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -qqy build-essential mold musl-tools
+
+      - name: Setup protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: '35.1'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: 1.95
+          target: x86_64-unknown-linux-musl
+          cache: false
+          rustflags: ''
+
+      - name: Build easytier-core / easytier-cli (musl, static)
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl -p easytier --features=jemalloc
+          file target/x86_64-unknown-linux-musl/release/easytier-core
+
+      - name: Resolve version
+        id: ver
+        run: |
+          V="${{ inputs.version }}"
+          B="${{ inputs.base_version }}"
+          [ -n "$V" ] || V="v2.7.0-fix1"
+          [ -n "$B" ] || B="2.7.0"
+          echo "VERSION=$V" >> "$GITHUB_ENV"
+          echo "BASE=$B" >> "$GITHUB_ENV"
+
+      - name: Assemble release zip
+        run: |
+          set -euo pipefail
+          BIN=target/x86_64-unknown-linux-musl/release
+          mkdir -p out
+          # 官方 zip 提供 easytier-web / easytier-web-embed（与本次修复无关，直接复用）
+          curl -sSL --retry 3 -o /tmp/official.zip \
+            "https://github.com/EasyTier/EasyTier/releases/download/v${BASE}/easytier-linux-x86_64-v${BASE}.zip"
+          unzip -o -j /tmp/official.zip -d out
+          rm -f out/easytier-core out/easytier-cli
+          cp "$BIN/easytier-core" "$BIN/easytier-cli" out/
+          chmod 755 out/*
+
+          # 与上游一致做 UPX 压缩，避免 ipk 体积翻倍
+          curl -sSL --retry 3 -o /tmp/upx.tar.xz \
+            https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-amd64_linux.tar.xz
+          tar xJf /tmp/upx.tar.xz -C /tmp
+          /tmp/upx-4.2.4-amd64_linux/upx --lzma --best out/easytier-core out/easytier-cli || true
+
+          echo "=== 产物清单 ==="
+          ls -l out
+          echo "=== 版本自检（应带本次提交的短 hash，而不是 8b7f1f01） ==="
+          ./out/easytier-core --version
+          echo "=== sha256 ==="
+          sha256sum out/easytier-core out/easytier-cli
+
+          cd out && zip -qr "../easytier-linux-x86_64-${VERSION}.zip" .
+
+      - name: Upload build artifact (兜底：release 失败也能拿到 zip)
+        uses: actions/upload-artifact@v4
+        with:
+          name: easytier-linux-x86_64-${{ env.VERSION }}
+          path: easytier-linux-x86_64-${{ env.VERSION }}.zip
+          if-no-files-found: error
+
+      - name: Publish release
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.VERSION }}
+          draft: false
+          prerelease: false
+          body: |
+            EasyTier ${{ env.BASE }} + 路由重试修复（apply_route_changes 失败不再登记为已安装）。
+
+            - 仅替换 `easytier-core` / `easytier-cli`；`easytier-web` 复用官方 v${{ env.BASE }} 构建。
+            - `easytier-core --version` 的哈希后缀与官方 v${{ env.BASE }} 不同，可据此区分。
+          files: easytier-linux-x86_64-${{ env.VERSION }}.zip
+          token: ${{ secrets.GITHUB_TOKEN }}
