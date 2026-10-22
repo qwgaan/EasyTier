@@ -987,14 +987,15 @@ impl NicCtx {
                 .add_ipv4_route(ifname, cidr.first_address(), cidr.network_length(), None)
                 .await;
 
-            if ret.is_err() {
-                tracing::trace!(
-                    cidr = ?cidr,
-                    err = ?ret,
-                    "add route failed.",
-                );
+            match ret {
+                Ok(()) => {
+                    cur_proxy_cidrs.insert(cidr);
+                }
+                Err(err) => {
+                    // 失败绝不登记为"已安装"，留待下一次 ProxyCidrsUpdated 重试
+                    tracing::error!(cidr = ?cidr, ?err, "add route failed");
+                }
             }
-            cur_proxy_cidrs.insert(cidr);
         }
     }
 
